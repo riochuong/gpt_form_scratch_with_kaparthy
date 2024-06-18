@@ -17,6 +17,8 @@ n_head = 6
 dropout = 0.2
 # ----------------------------------
 
+print("DEVICE ", device)
+
 with open('input.txt', 'r', encoding='utf8') as f:
     text = f.read()
 
@@ -47,7 +49,7 @@ def get_batch(split):
     return x,y 
 
 
-@torch.no_grad
+@torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
@@ -96,11 +98,55 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel"""
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        # this give more channels for communication between tokens 
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        # https://towardsdatascience.com/residual-blocks-building-blocks-of-resnet-fd90ca15d6ec
+        # projection back to input residual path way 
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        # the projection is just the linear transformation of the self-attention layer
+        return self.dropout(self.proj(out))
+
+class Head(nn.Module):
+    """ one head of self-attentiion """
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.droput = nn.Dropout(dropout)
+        # tril is not a parameter, it's more like a helper matrix 
+        # for us to prevent data from passing from the future to current token
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+    
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x) # key (B, T, C) @ (B, C, head_size) -> (B, T, head_size)
+        q = self.query(x) # (B, T, C)
+
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B,T,C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.droput(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x) # (B,T,C)
+        out = wei @ v # (B,T,T) @ (B,T,C) -> (B,T,C)
+        return out
+
 
 class GPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table =  nn.Embedding(block_size, n_embd)
         # we are now having 4 communication channels with multi-head attentions
         # we concatenate all heads out put to give us 32 
@@ -118,7 +164,6 @@ class GPTLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-
         # idx and targets are both (B, T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
@@ -157,55 +202,9 @@ class GPTLanguageModel(nn.Module):
 
 model = GPTLanguageModel(vocab_size=vocab_size)
 
-class Head(nn.Module):
-    """ one head of self-attentiion """
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.droput = nn.Dropout(dropout)
-        # tril is not a parameter, it's more like a helper matrix 
-        # for us to prevent data from passing from the future to current token
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-    
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x) # key (B, T, C) @ (B, C, head_size) -> (B, T, head_size)
-        q = self.query(x) # (B, T, C)
-
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B,T,C) @ (B, C, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.droput(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,C)
-        out = wei @ v # (B,T,T) @ (B,T,C) -> (B,T,C)
-        return out
-
-
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel"""
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        # this give more channels for communication between tokens 
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        # https://towardsdatascience.com/residual-blocks-building-blocks-of-resnet-fd90ca15d6ec
-        # projection back to input residual path way 
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        # the projection is just the linear transformation of the self-attention layer
-        return self.dropout(self.proj(out))
-
-
 m = model.to(device)
 # create a pytorch optimizer 
-optimizer = torch.optim.AdamW()
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 #---- TRAINING LOOP -----
 for iter in range(max_iters):
@@ -213,7 +212,7 @@ for iter in range(max_iters):
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses["train"]:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
     
     # sample a batch of data
     xb, yb = get_batch("train")
@@ -223,6 +222,8 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+
+torch.save(model.state_dict(), 'model_weights.pth')
 
 # generat from the model 
 context = torch.zeros((1,1), dtype=torch.long, device=device)
